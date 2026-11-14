@@ -1,0 +1,13 @@
+!.vscode/*
+# CMake / Pico SDK build output
+build/
+build-*/
+cmake-build-*/
+
+# Editor temporary files
+*.swp
+*~
+*.bak
+
+# Python cache
+__pycache__/
