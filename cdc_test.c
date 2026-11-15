@@ -38,16 +38,66 @@ uint8_t mem[65536];
 #include "pico/stdlib.h"
 #include <stdint.h>
 
+// 共有メモリ
+extern uint8_t mem[65536];
+
+// interface variables on mem[]
 #define PUTCH_TRIGGER 0xe000
 #define PUTCH_DATA 0xe001
 #define PUTCH_TXREADY 0xe002
 
-// 共有メモリ
-extern uint8_t mem[65536];
+#define GETCH_ACK 0xe003
+#define GETCH_DATA 0xe004
+#define GETCH_RXREADY 0xe005
 
 // 指定アドレスをvolatileアクセスする
 #define MEM_VOLATILE(addr) \
     (*(volatile uint8_t *)&mem[(addr)])
+
+// function declaration
+static uint8_t getch(void);
+static void putch(uint8_t c);
+
+//
+// bool kbhit(void) ... CDC データ受信可能かどうかを調べる。
+//
+static bool kbhit(void) {
+    // 前回の受信完了通知が未処理なら、
+    // 新しい受信データはまだ利用できない
+    if (MEM_VOLATILE(GETCH_ACK) != 0) {
+        return false;
+    }
+
+    // 受信データが存在するか確認
+    return MEM_VOLATILE(GETCH_RXREADY) != 0;
+}
+
+static uint8_t getch(void) {
+    // 前回の受信完了通知が処理されるまで待つ
+    while (MEM_VOLATILE(GETCH_ACK) != 0) {
+        tight_loop_contents();
+    }
+
+    __dmb();
+
+    // 受信データが到着するまで待つ
+    while (MEM_VOLATILE(GETCH_RXREADY) == 0) {
+        tight_loop_contents();
+    }
+
+    // Core0が書き込んだDATAを読み出す
+    __dmb();
+
+    uint8_t c = MEM_VOLATILE(GETCH_DATA);
+
+    // DATAの読み出しをACKの通知より先行させる
+    __dmb();
+
+    // Core0へ受信完了を通知
+    MEM_VOLATILE(GETCH_ACK) = 1;
+
+    return c;
+}
 
 //
 // putch() - 同期式1文字出力
@@ -97,6 +147,7 @@ __attribute__((noinline)) void __time_critical_func(cdc_test_core1_entry)(void) 
 
     int count = 0;
     while (true) {
+#if 0
         const char *p = message;
 
         putch(alphabet[count++ % 26]);
@@ -105,7 +156,14 @@ __attribute__((noinline)) void __time_critical_func(cdc_test_core1_entry)(void) 
             putch((uint8_t)*p++);
         }
 
-        //sleep_ms(1000);
+        // sleep_ms(1000);
+#endif
+        while (!kbhit()) {
+            tight_loop_contents();
+        }
+
+        int c = getch();
+        putch(c);
     }
 }
 
@@ -168,6 +226,43 @@ static void cdc_send_poll(void) {
     MEM_VOLATILE(PUTCH_TRIGGER) = 0;
 }
 
+static void cdc_receive_poll(void) {
+    // Core1からの受信完了通知を処理
+    if (MEM_VOLATILE(GETCH_ACK) != 0) {
+        // RXREADYのクリアをACKのクリアより先行させる
+        MEM_VOLATILE(GETCH_RXREADY) = 0;
+        __dmb();
+        MEM_VOLATILE(GETCH_ACK) = 0;
+        return;
+    }
+
+    // 前回の受信データが未取得なら何もしない
+    if (MEM_VOLATILE(GETCH_RXREADY) != 0) {
+        return;
+    }
+
+    // TinyUSB CDCに受信データがなければ終了
+    if (tud_cdc_n_available(cdc_itf) == 0) {
+        return;
+    }
+
+    // TinyUSB CDCから1バイト読み出す
+    uint8_t cb;
+
+    if (tud_cdc_n_read(cdc_itf, &cb, 1) != 1) {
+        return;
+    }
+
+    // 受信データを共有SRAMに格納
+    MEM_VOLATILE(GETCH_DATA) = cb;
+
+    // DATAの書き込みをRXREADYの通知より先行させる
+    __dmb();
+
+    // Core1へ受信データがあることを通知
+    MEM_VOLATILE(GETCH_RXREADY) = 1;
+}
+
 __attribute__((noinline)) int __time_critical_func(main)(void) {
     stdio_init_all();
 
@@ -183,6 +278,10 @@ __attribute__((noinline)) int __time_critical_func(main)(void) {
     // For more examples of UART use see https://github.com/raspberrypi/pico-examples/tree/master/uart
     // UART0だけを使用
 
+    // initialze interface variables
+    MEM_VOLATILE(GETCH_ACK) = 0;
+    MEM_VOLATILE(GETCH_DATA) = 0;
+    MEM_VOLATILE(GETCH_RXREADY) = 0;
     // TinyUSB CDC が立ち上がるまでの時間を稼ぐ
     sleep_ms(1000);
 
@@ -194,46 +293,13 @@ __attribute__((noinline)) int __time_critical_func(main)(void) {
     multicore_launch_core1(cdc_test_core1_entry);
     // usb CDC handling
     int c;
-    uint8_t cb = 'A';
-    uint32_t data;
-    uint32_t cmd;
     uint32_t time0 = time_ms_32();
+    // infinite loop for CDC send/receive polling functions
     while (1) {
         tud_task();
 
         cdc_send_poll();
-        // cdc_receive_poll();
+        cdc_receive_poll();
         tight_loop_contents();
     }
-#if 0    
-        //
-        if (time_ms_32() - time0 < 1000) {
-            tight_loop_contents();
-            continue;
-        }
-        time0 = time_ms_32();
-        while (tud_cdc_n_write_available(cdc_itf) <= 0) {
-            tud_task();
-            tight_loop_contents();
-        }
-        tud_cdc_n_write(cdc_itf, &cb, 1);
-        tud_cdc_n_write_flush(cdc_itf);
-#endif
-#if 0
-        if (rx_rdy == 0 && tud_cdc_n_available(cdc_itf) > 0) {
-            tud_cdc_n_read(cdc_itf, &cb, 1);
-            rx_data = cb;
-            rx_rdy = 1;
-        }
-        if (tx_rdy == 0 && tud_cdc_n_write_available(cdc_itf) > 0) {
-            tx_rdy = 2;
-        }
-        if (tx_rdy && txbuf_full) {
-            cb = tx_data;
-            tud_cdc_n_write(cdc_itf, &cb, 1);
-            tud_cdc_n_write_flush(cdc_itf);     // flush seems to be needed
-            txbuf_full = 0;
-            tx_rdy = 0;
-        }
-#endif
 }
